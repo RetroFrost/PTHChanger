@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Build the voice-neutral RVC v2/F0/40k synthesizer used by PTHChanger.
 
+Upstream RVC relative-attention code converts sequence lengths to Python ints
+while tracing. A nominally dynamic legacy ONNX export therefore bakes reshape
+sizes and breaks at any length other than the traced one. PTHChanger avoids
+that trap deliberately: it exports a fixed 400-frame (4 second) graph, while
+Android pads every chunk to 400 frames and crops the synthesized result back
+to the chunk's real length. Long files are handled by overlapping chunks.
+
 The ONNX model contains placeholder initializers with the exact same
-names/shapes as the supported RVC checkpoint. Android replaces those
+names/shapes as the supported RVC checkpoint. Android replaces all 457
 initializers from the user's .pth before creating the ORT session.
 """
 
@@ -17,7 +24,9 @@ import onnx
 import torch
 from torch import nn
 
-# JayModern-compatible RVC v2, F0, 40 kHz profile.
+FIXED_FRAMES = 400
+SAMPLES_PER_FRAME = 400
+
 CONFIG = [
     1025, 32, 192, 192, 768, 2, 6, 3, 0,
     "1", [3, 7, 11], [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
@@ -38,14 +47,22 @@ class InferenceWrapper(nn.Module):
         return self.model.dec(z * x_mask, pitchf, g=g)
 
 
-def make_inputs(np, frames: int):
+def make_inputs(np, actual_frames: int = FIXED_FRAMES):
+    assert 1 <= actual_frames <= FIXED_FRAMES
+    phone = np.zeros((1, FIXED_FRAMES, 768), np.float32)
+    pitch = np.ones((1, FIXED_FRAMES), np.int64)
+    pitchf = np.zeros((1, FIXED_FRAMES), np.float32)
+    rnd = np.zeros((1, 192, FIXED_FRAMES), np.float32)
+    phone[:, :actual_frames, :] = 0.01
+    pitch[:, :actual_frames] = 128
+    pitchf[:, :actual_frames] = 120.0
     return {
-        "phone": np.zeros((1, frames, 768), np.float32),
-        "phone_lengths": np.asarray([frames], np.int64),
-        "pitch": np.full((1, frames), 128, np.int64),
-        "pitchf": np.full((1, frames), 120.0, np.float32),
+        "phone": phone,
+        "phone_lengths": np.asarray([actual_frames], np.int64),
+        "pitch": pitch,
+        "pitchf": pitchf,
         "sid": np.asarray([1], np.int64),
-        "rnd": np.zeros((1, 192, frames), np.float32),
+        "rnd": rnd,
     }
 
 
@@ -72,7 +89,7 @@ def main() -> int:
     manifest_path = Path(args.manifest)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    t = 16
+    t = FIXED_FRAMES
     inputs = (
         torch.zeros(1, t, 768, dtype=torch.float32),
         torch.tensor([t], dtype=torch.long),
@@ -82,20 +99,13 @@ def main() -> int:
         torch.zeros(1, 192, t, dtype=torch.float32),
     )
 
-    print("Exporting generic RVC synthesizer...")
+    print(f"Exporting fixed {FIXED_FRAMES}-frame generic RVC synthesizer...")
     torch.onnx.export(
         wrapper,
         inputs,
         str(out),
         input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"],
         output_names=["waveform"],
-        dynamic_axes={
-            "phone": {1: "frames"},
-            "pitch": {1: "frames"},
-            "pitchf": {1: "frames"},
-            "rnd": {2: "frames"},
-            "waveform": {2: "samples"},
-        },
         opset_version=17,
         do_constant_folding=False,
         keep_initializers_as_inputs=True,
@@ -153,11 +163,13 @@ def main() -> int:
         raise RuntimeError(f"Expected 457 runtime RVC tensors, got {len(weights)}")
 
     manifest = {
-        "format": 1,
+        "format": 2,
         "version": "v2",
         "f0": True,
         "sampleRate": 40000,
         "speakerCount": 109,
+        "fixedFrames": FIXED_FRAMES,
+        "samplesPerFrame": SAMPLES_PER_FRAME,
         "normalInputs": ["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"],
         "weights": weights,
     }
@@ -169,22 +181,22 @@ def main() -> int:
     import numpy as np
     import onnxruntime as ort
 
-    # 1) Prove the exported graph really has dynamic time axes rather than
-    # merely labels attached to a T=16 trace.
     base = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
-    for frames in (16, 33, 100):
-        result = base.run(["waveform"], make_inputs(np, frames))[0]
-        expected_samples = frames * 400
+    for actual_frames in (FIXED_FRAMES, 173):
+        result = base.run(["waveform"], make_inputs(np, actual_frames))[0]
+        expected_samples = FIXED_FRAMES * SAMPLES_PER_FRAME
         if result.shape != (1, 1, expected_samples):
             raise RuntimeError(
-                f"Dynamic RVC graph failed for T={frames}: {result.shape}, expected (1,1,{expected_samples})"
+                f"Fixed RVC graph failed: {result.shape}, expected (1,1,{expected_samples})"
             )
         if not np.isfinite(result).all():
-            raise RuntimeError(f"Non-finite RVC output for T={frames}")
-        print("ORT dynamic smoke:", frames, result.shape, float(np.max(np.abs(result))))
+            raise RuntimeError(f"Non-finite RVC output for actual_frames={actual_frames}")
+        cropped = result[:, :, : actual_frames * SAMPLES_PER_FRAME]
+        print(
+            "ORT fixed smoke:", actual_frames, result.shape,
+            "cropped", cropped.shape, "peak", float(np.max(np.abs(cropped)))
+        )
 
-    # 2) Prove ORT can replace every initializer at session creation. This is
-    # the same mechanism the Android app uses after parsing the selected .pth.
     opts = ort.SessionOptions()
     keepalive = []
     for spec in weights:
@@ -194,8 +206,8 @@ def main() -> int:
         keepalive.append((array, value))
         opts.add_initializer(spec["onnxName"], value)
     overridden = ort.InferenceSession(str(out), sess_options=opts, providers=["CPUExecutionProvider"])
-    result = overridden.run(["waveform"], make_inputs(np, 33))[0]
-    if result.shape != (1, 1, 33 * 400) or not np.isfinite(result).all():
+    result = overridden.run(["waveform"], make_inputs(np, 251))[0]
+    if result.shape != (1, 1, FIXED_FRAMES * SAMPLES_PER_FRAME) or not np.isfinite(result).all():
         raise RuntimeError(f"Runtime initializer override smoke failed: {result.shape}")
     print("ORT 457-initializer override smoke:", result.shape, float(np.max(np.abs(result))))
     return 0
