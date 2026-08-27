@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the voice-neutral RVC v2/F0/40k synthesizer used by PTHChanger.
 
-The ONNX model contains random placeholder initializers with the exact same
+The ONNX model contains placeholder initializers with the exact same
 names/shapes as the supported RVC checkpoint. Android replaces those
 initializers from the user's .pth before creating the ORT session.
 """
@@ -24,8 +24,6 @@ CONFIG = [
     [10, 10, 2, 2], 512, [16, 16, 4, 4], 109, 256, 40000,
 ]
 
-NORMAL_INPUTS = {"phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"}
-
 
 class InferenceWrapper(nn.Module):
     def __init__(self, model: nn.Module):
@@ -38,6 +36,17 @@ class InferenceWrapper(nn.Module):
         z_p = (m_p + torch.exp(logs_p) * rnd * 0.66666) * x_mask
         z = self.model.flow(z_p, x_mask, g=g, reverse=True)
         return self.model.dec(z * x_mask, pitchf, g=g)
+
+
+def make_inputs(np, frames: int):
+    return {
+        "phone": np.zeros((1, frames, 768), np.float32),
+        "phone_lengths": np.asarray([frames], np.int64),
+        "pitch": np.full((1, frames), 128, np.int64),
+        "pitchf": np.full((1, frames), 120.0, np.float32),
+        "sid": np.asarray([1], np.int64),
+        "rnd": np.zeros((1, 192, frames), np.float32),
+    }
 
 
 def main() -> int:
@@ -67,7 +76,7 @@ def main() -> int:
     inputs = (
         torch.zeros(1, t, 768, dtype=torch.float32),
         torch.tensor([t], dtype=torch.long),
-        torch.ones(1, t, dtype=torch.long),
+        torch.full((1, t), 128, dtype=torch.long),
         torch.full((1, t), 120.0, dtype=torch.float32),
         torch.tensor([1], dtype=torch.long),
         torch.zeros(1, 192, t, dtype=torch.float32),
@@ -97,21 +106,25 @@ def main() -> int:
     onnx.checker.check_model(graph)
 
     state = wrapper.state_dict()
-    initializer_names = {x.name for x in graph.graph.initializer}
     weights = []
     unmatched_initializers = []
+    onnx_to_state = {}
 
     for init in graph.graph.initializer:
         name = init.name
+        state_name = None
         checkpoint_name = None
         if name in state:
+            state_name = name
             checkpoint_name = name.removeprefix("model.")
         elif f"model.{name}" in state:
+            state_name = f"model.{name}"
             checkpoint_name = name
         if checkpoint_name is None:
             unmatched_initializers.append(name)
             continue
-        tensor = state[name if name in state else f"model.{name}"]
+        tensor = state[state_name]
+        onnx_to_state[name] = state_name
         weights.append({
             "onnxName": name,
             "checkpointName": checkpoint_name,
@@ -136,6 +149,8 @@ def main() -> int:
     if missing:
         print("MISSING_STATE", missing[:30])
         raise RuntimeError("Not every inference checkpoint tensor maps to an ONNX initializer")
+    if len(weights) != 457:
+        raise RuntimeError(f"Expected 457 runtime RVC tensors, got {len(weights)}")
 
     manifest = {
         "format": 1,
@@ -151,20 +166,38 @@ def main() -> int:
     print(f"Generic synth: {out} ({out.stat().st_size / 1024**2:.1f} MiB)")
     print(f"Manifest: {manifest_path}")
 
-    # CPU smoke test. This proves the generated graph itself is executable.
     import numpy as np
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
-    ort_inputs = {
-        "phone": np.zeros((1, t, 768), np.float32),
-        "phone_lengths": np.asarray([t], np.int64),
-        "pitch": np.ones((1, t), np.int64),
-        "pitchf": np.full((1, t), 120.0, np.float32),
-        "sid": np.asarray([1], np.int64),
-        "rnd": np.zeros((1, 192, t), np.float32),
-    }
-    result = sess.run(["waveform"], ort_inputs)[0]
-    print("ORT synth smoke output:", result.shape, result.dtype, float(np.max(np.abs(result))))
+
+    # 1) Prove the exported graph really has dynamic time axes rather than
+    # merely labels attached to a T=16 trace.
+    base = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
+    for frames in (16, 33, 100):
+        result = base.run(["waveform"], make_inputs(np, frames))[0]
+        expected_samples = frames * 400
+        if result.shape != (1, 1, expected_samples):
+            raise RuntimeError(
+                f"Dynamic RVC graph failed for T={frames}: {result.shape}, expected (1,1,{expected_samples})"
+            )
+        if not np.isfinite(result).all():
+            raise RuntimeError(f"Non-finite RVC output for T={frames}")
+        print("ORT dynamic smoke:", frames, result.shape, float(np.max(np.abs(result))))
+
+    # 2) Prove ORT can replace every initializer at session creation. This is
+    # the same mechanism the Android app uses after parsing the selected .pth.
+    opts = ort.SessionOptions()
+    keepalive = []
+    for spec in weights:
+        state_name = onnx_to_state[spec["onnxName"]]
+        array = state[state_name].detach().cpu().numpy().astype(np.float32, copy=False)
+        value = ort.OrtValue.ortvalue_from_numpy(array)
+        keepalive.append((array, value))
+        opts.add_initializer(spec["onnxName"], value)
+    overridden = ort.InferenceSession(str(out), sess_options=opts, providers=["CPUExecutionProvider"])
+    result = overridden.run(["waveform"], make_inputs(np, 33))[0]
+    if result.shape != (1, 1, 33 * 400) or not np.isfinite(result).all():
+        raise RuntimeError(f"Runtime initializer override smoke failed: {result.shape}")
+    print("ORT 457-initializer override smoke:", result.shape, float(np.max(np.abs(result))))
     return 0
 
 
