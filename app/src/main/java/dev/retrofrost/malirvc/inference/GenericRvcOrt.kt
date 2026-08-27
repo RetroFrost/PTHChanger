@@ -48,7 +48,6 @@ class GenericRvcOrt(
         for (i in 0 until specs.length()) {
             val spec = specs.getJSONObject(i)
             val checkpointName = spec.getString("checkpointName")
-            val onnxName = spec.getString("onnxName")
             val expected = spec.getJSONArray("shape")
             val actual = checkpoint.weights[checkpointName]
                 ?: error("Checkpoint is missing required RVC tensor '$checkpointName'")
@@ -71,7 +70,10 @@ class GenericRvcOrt(
         fun makeOptions(useNnapi: Boolean): OrtSession.SessionOptions {
             val result = OrtSession.SessionOptions()
             for (i in 0 until specs.length()) {
-                result.addInitializer(specs.getJSONObject(i).getString("onnxName"), initializerTensors[i])
+                result.addInitializer(
+                    specs.getJSONObject(i).getString("onnxName"),
+                    initializerTensors[i]
+                )
             }
             if (useNnapi && Build.VERSION.SDK_INT >= 27) {
                 result.addNnapi(EnumSet.of(NNAPIFlags.USE_FP16))
@@ -84,20 +86,26 @@ class GenericRvcOrt(
         var accelerated = false
         if (Build.VERSION.SDK_INT >= 27) {
             try {
-                selectedOptions = makeOptions(true)
-                selectedSession = env.createSession(modelPath, selectedOptions)
-                accelerated = true
+                val acceleratedOptions = makeOptions(true)
+                try {
+                    selectedSession = env.createSession(modelPath, acceleratedOptions)
+                    selectedOptions = acceleratedOptions
+                    accelerated = true
+                } catch (e: OrtException) {
+                    acceleratedOptions.close()
+                    throw e
+                }
             } catch (_: OrtException) {
-                selectedOptions?.close()
-                selectedOptions = null
+                // Some NNAPI drivers reject individual RVC ops. In that case
+                // create a normal ORT session rather than failing conversion.
             }
         }
         if (selectedSession == null) {
             selectedOptions = makeOptions(false)
             selectedSession = env.createSession(modelPath, selectedOptions)
         }
-        options = selectedOptions
-        session = selectedSession
+        options = selectedOptions ?: error("Failed to create ONNX Runtime options")
+        session = selectedSession ?: error("Failed to create RVC ONNX Runtime session")
         acceleratorEnabled = accelerated
     }
 
