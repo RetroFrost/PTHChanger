@@ -1,9 +1,9 @@
 package dev.retrofrost.malirvc
 
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.View
@@ -46,16 +46,25 @@ class MainActivity : AppCompatActivity() {
     }
     private val pickAudio = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
+            runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             inputAudio = uri
             audioInfo.text = displayName(uri)
+            status.text = if (modelFile != null) "Ready to convert" else "Audio ready • select a .pth model"
         }
     }
     private val saveOutput = registerForActivityResult(ActivityResultContracts.CreateDocument("audio/wav")) { uri ->
         val src = outputFile ?: return@registerForActivityResult
         if (uri != null) {
             lifecycleScope.launch(Dispatchers.IO) {
-                contentResolver.openOutputStream(uri, "w")!!.use { out -> src.inputStream().use { it.copyTo(out) } }
-                withContext(Dispatchers.Main) { status.text = "Saved ${displayName(uri)}" }
+                runCatching {
+                    contentResolver.openOutputStream(uri, "w")?.use { out ->
+                        src.inputStream().use { it.copyTo(out) }
+                    } ?: error("Unable to open destination")
+                }.onSuccess {
+                    withContext(Dispatchers.Main) { status.text = "Saved ${displayName(uri)}" }
+                }.onFailure { error ->
+                    withContext(Dispatchers.Main) { status.text = "Save failed: ${error.message}" }
+                }
             }
         }
     }
@@ -65,16 +74,17 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         bindViews()
 
-        val hasVulkan = packageManager.hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
-        findViewById<TextView>(R.id.gpuStatus).text = if (hasVulkan) {
-            "Vulkan available • RVC synthesizer targets Android GPU / Mali"
+        findViewById<TextView>(R.id.gpuStatus).text = if (Build.VERSION.SDK_INT >= 27) {
+            "Android NNAPI acceleration enabled when supported • Mali/GPU selection is handled by the device driver • CPU fallback"
         } else {
-            "Vulkan not reported by this device • GPU runtime may not start"
+            "Offline CPU inference • Android accelerator path requires Android 8.1+"
         }
 
         val missing = RvcPipeline.missingRuntimeAssets(this)
-        if (missing.isNotEmpty()) {
-            status.text = "Source build: runtime pack missing (${missing.joinToString { it.substringAfterLast('/') }})"
+        status.text = if (missing.isEmpty()) {
+            "Offline runtime ready"
+        } else {
+            "Invalid build • missing ${missing.joinToString { it.substringAfterLast('/') }}"
         }
 
         findViewById<MaterialButton>(R.id.selectModel).setOnClickListener {
@@ -114,10 +124,17 @@ class MainActivity : AppCompatActivity() {
                 val file = withContext(Dispatchers.IO) {
                     val dir = File(filesDir, "models").apply { mkdirs() }
                     val out = File(dir, "selected.pth")
-                    contentResolver.openInputStream(uri)!!.use { input -> out.outputStream().use { input.copyTo(it) } }
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        out.outputStream().use { input.copyTo(it) }
+                    } ?: error("Unable to open model")
                     out
                 }
                 val info = withContext(Dispatchers.IO) { PthCheckpoint(file).use { it.info } }
+                require(info.version == "v2" && info.f0) { "PTHChanger 1.0 requires an RVC v2 F0 model" }
+                require(info.sampleRate == 40_000) { "PTHChanger 1.0 requires a 40 kHz model" }
+                require(info.speakerCount == 109) { "This runtime profile requires 109 speaker embeddings" }
+                require(info.tensors == 457) { "Unexpected RVC tensor layout (${info.tensors} tensors)" }
+
                 modelFile = file
                 speakerCount = info.speakerCount
                 speakerEdit.setText(info.defaultSpeakerId.toString())
@@ -128,9 +145,10 @@ class MainActivity : AppCompatActivity() {
                     append("\nContentVec ").append(info.embedder ?: "768")
                     append(" • ").append(info.vocoder ?: "HiFi-GAN")
                     append(" • speakers 0–").append(info.speakerCount - 1)
+                    append(" • default ").append(info.defaultSpeakerId)
                     info.epoch?.let { append(" • epoch ").append(it) }
                 }
-                status.text = "Model ready"
+                status.text = if (inputAudio != null) "Ready to convert" else "Model ready • select audio"
             } catch (t: Throwable) {
                 modelFile = null
                 modelInfo.text = "Model rejected: ${t.message}"
@@ -144,13 +162,15 @@ class MainActivity : AppCompatActivity() {
     private fun convert() {
         val model = modelFile ?: return showStatus("Select a .pth model first")
         val audio = inputAudio ?: return showStatus("Select an audio file first")
-        val sid = speakerEdit.text?.toString()?.toIntOrNull() ?: 0
+        val sid = speakerEdit.text?.toString()?.toIntOrNull()
+            ?: return showStatus("Enter a speaker ID")
         if (sid !in 0 until speakerCount) return showStatus("Speaker ID must be 0–${speakerCount - 1}")
         val pitch = pitchSlider.value.toInt()
 
         lifecycleScope.launch {
             setBusy(true, "Starting conversion")
             outputCard.visibility = View.GONE
+            outputFile = null
             try {
                 val out = withContext(Dispatchers.IO) {
                     RvcPipeline(this@MainActivity).convert(model, audio, pitch, sid) { message ->
