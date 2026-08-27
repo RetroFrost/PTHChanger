@@ -9,6 +9,7 @@ import dev.retrofrost.malirvc.model.PthCheckpoint
 import dev.retrofrost.malirvc.util.AssetUtils
 import java.io.File
 import kotlin.math.ln
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToLong
 
@@ -70,21 +71,28 @@ class RvcPipeline(private val context: Context) {
                         starts.forEachIndexed { index, start16k ->
                             val end16k = (start16k + chunkSamples).coerceAtMost(wave16k.size)
                             val chunk = wave16k.copyOfRange(start16k, end16k)
-                            onStatus("Converting ${index + 1}/${starts.size} • ContentVec")
+
+                            val cvBackend = if (contentVec.acceleratorEnabled) "accelerator" else "CPU"
+                            onStatus("Converting ${index + 1}/${starts.size} • ContentVec $cvBackend")
                             val baseFeatures = contentVec.extract(chunk)
-                            val pLen = chunk.size / 160
+                            // Upstream RVC doubles HuBERT/ContentVec frame rate, then
+                            // clips p_len to whichever stream is shorter.
+                            val pLen = min(chunk.size / 160, baseFeatures.frames * 2)
                             require(pLen > 0) { "Audio chunk is too short" }
                             val phone = upsampleContentVec(baseFeatures, pLen)
 
-                            onStatus("Converting ${index + 1}/${starts.size} • RMVPE")
-                            var f0 = rmvpe.extract(chunk)
-                            f0 = alignF0(f0, pLen)
+                            val f0Backend = if (rmvpe.acceleratorEnabled) "accelerator" else "CPU"
+                            onStatus("Converting ${index + 1}/${starts.size} • RMVPE $f0Backend")
+                            var f0 = alignF0(rmvpe.extract(chunk), pLen)
+                            // Upstream RVC linearly fills unvoiced RMVPE frames before
+                            // applying the semitone shift and coarse-pitch quantization.
+                            fillUnvoicedInPlace(f0)
                             val ratio = 2.0.pow(pitchShift / 12.0).toFloat()
                             for (i in f0.indices) if (f0[i] > 0f) f0[i] *= ratio
                             val coarse = coarsePitch(f0)
 
-                            val backend = if (synth.acceleratorEnabled) "Android accelerator" else "CPU"
-                            onStatus("Converting ${index + 1}/${starts.size} • $backend")
+                            val synthBackend = if (synth.acceleratorEnabled) "accelerator" else "CPU"
+                            onStatus("Converting ${index + 1}/${starts.size} • RVC $synthBackend")
                             val converted = synth.infer(phone, pLen, coarse, f0, speakerId.toLong())
                             val overlap16k = if (index == 0) 0 else (previousEnd16k - start16k).coerceAtLeast(0)
                             val overlap40k = ((overlap16k.toLong() * 40_000L) / 16_000L).toInt()
@@ -129,6 +137,26 @@ class RvcPipeline(private val context: Context) {
             out[i] = source[a] * (1f - f) + source[b] * f
         }
         return out
+    }
+
+    private fun fillUnvoicedInPlace(f0: FloatArray) {
+        val voiced = f0.indices.filter { f0[it] > 0f }
+        if (voiced.isEmpty()) return
+        val first = voiced.first()
+        for (i in 0 until first) f0[i] = f0[first]
+        val last = voiced.last()
+        for (i in last + 1 until f0.size) f0[i] = f0[last]
+        for (pair in 0 until voiced.size - 1) {
+            val a = voiced[pair]
+            val b = voiced[pair + 1]
+            if (b <= a + 1) continue
+            val fa = f0[a]
+            val fb = f0[b]
+            for (i in a + 1 until b) {
+                val t = (i - a).toFloat() / (b - a).toFloat()
+                f0[i] = fa * (1f - t) + fb * t
+            }
+        }
     }
 
     private fun chunkStarts(total: Int, chunk: Int, overlap: Int): List<Int> {
