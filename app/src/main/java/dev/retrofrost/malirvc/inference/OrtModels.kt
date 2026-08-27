@@ -21,7 +21,7 @@ class ContentVecOrt(modelPath: String) : Closeable {
             session.run(mapOf(inputName to input)).use { result ->
                 var tensor: OnnxTensor? = null
                 for (i in 0 until result.size()) {
-                    val candidate = result[i] as? OnnxTensor2 ?: continue
+                    val candidate = result[i] as? OnnxTensor ?: continue
                     val shape = candidate.info.shape
                     if (shape.size == 3 && shape[0] == 1L && shape[2] == 768L) {
                         tensor = candidate
