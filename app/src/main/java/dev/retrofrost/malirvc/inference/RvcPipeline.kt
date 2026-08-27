@@ -16,7 +16,7 @@ class RvcPipeline(private val context: Context) {
     companion object {
         const val CONTENTVEC = "runtime/contentvec_v2.onnx"
         const val RMVPE = "runtime/rmvpe.onnx"
-        const val SYNTH = "runtime/rvc_v2_f0_40k_s109_vulkan.pte"
+        const val SYNTH = "runtime/rvc_v2_f0_40k_s109.onnx"
         const val MANIFEST = "runtime/rvc_weights_manifest.json"
 
         fun missingRuntimeAssets(context: Context): List<String> =
@@ -32,7 +32,9 @@ class RvcPipeline(private val context: Context) {
     ): File {
         onStatus("Reading .pth model")
         PthCheckpoint(checkpointFile).use { checkpoint ->
-            require(checkpoint.info.version == "v2" && checkpoint.info.f0)
+            require(checkpoint.info.version == "v2" && checkpoint.info.f0) {
+                "Only F0-enabled RVC v2 checkpoints are supported"
+            }
             require(checkpoint.info.sampleRate == 40_000) {
                 "This runtime profile is 40 kHz; model is ${checkpoint.info.sampleRate} Hz"
             }
@@ -43,7 +45,7 @@ class RvcPipeline(private val context: Context) {
 
             val missing = missingRuntimeAssets(context)
             require(missing.isEmpty()) {
-                "Runtime pack is incomplete: ${missing.joinToString()}. Bundle the shared runtime pack before building the APK."
+                "This APK is missing bundled runtime assets: ${missing.joinToString()}"
             }
 
             onStatus("Decoding audio")
@@ -62,25 +64,27 @@ class RvcPipeline(private val context: Context) {
 
             val audio40k = ContentVecOrt(contentVecFile.absolutePath).use { contentVec ->
                 RmvpeOrt(rmvpeFile.absolutePath).use { rmvpe ->
-                    GenericRvcExecuTorch(synthFile, manifest, checkpoint).use { synth ->
+                    GenericRvcOrt(synthFile.absolutePath, manifest, checkpoint).use { synth ->
                         var merged = FloatArray(0)
                         var previousEnd16k = 0
                         starts.forEachIndexed { index, start16k ->
                             val end16k = (start16k + chunkSamples).coerceAtMost(wave16k.size)
                             val chunk = wave16k.copyOfRange(start16k, end16k)
-                            onStatus("Converting chunk ${index + 1}/${starts.size} • ContentVec")
+                            onStatus("Converting ${index + 1}/${starts.size} • ContentVec")
                             val baseFeatures = contentVec.extract(chunk)
                             val pLen = chunk.size / 160
+                            require(pLen > 0) { "Audio chunk is too short" }
                             val phone = upsampleContentVec(baseFeatures, pLen)
 
-                            onStatus("Converting chunk ${index + 1}/${starts.size} • RMVPE")
+                            onStatus("Converting ${index + 1}/${starts.size} • RMVPE")
                             var f0 = rmvpe.extract(chunk)
                             f0 = alignF0(f0, pLen)
                             val ratio = 2.0.pow(pitchShift / 12.0).toFloat()
                             for (i in f0.indices) if (f0[i] > 0f) f0[i] *= ratio
                             val coarse = coarsePitch(f0)
 
-                            onStatus("Converting chunk ${index + 1}/${starts.size} • Vulkan")
+                            val backend = if (synth.acceleratorEnabled) "Android accelerator" else "CPU"
+                            onStatus("Converting ${index + 1}/${starts.size} • $backend")
                             val converted = synth.infer(phone, pLen, coarse, f0, speakerId.toLong())
                             val overlap16k = if (index == 0) 0 else (previousEnd16k - start16k).coerceAtLeast(0)
                             val overlap40k = ((overlap16k.toLong() * 40_000L) / 16_000L).toInt()
@@ -94,7 +98,8 @@ class RvcPipeline(private val context: Context) {
 
             onStatus("Writing WAV")
             val outDir = File(context.cacheDir, "converted").apply { mkdirs() }
-            val out = File(outDir, "${checkpoint.info.modelName}_${System.currentTimeMillis()}.wav")
+            val safeName = checkpoint.info.modelName.replace(Regex("[^A-Za-z0-9._-]+"), "_")
+            val out = File(outDir, "${safeName}_${System.currentTimeMillis()}.wav")
             WavWriter.write16BitMono(out, audio40k, 40_000)
             onStatus("Done")
             return out
@@ -102,6 +107,7 @@ class RvcPipeline(private val context: Context) {
     }
 
     private fun upsampleContentVec(features: ContentVecOrt.Features, targetFrames: Int): FloatArray {
+        require(features.channels == 768 && features.frames > 0)
         val out = FloatArray(targetFrames * 768)
         for (t in 0 until targetFrames) {
             val src = (t / 2).coerceAtMost(features.frames - 1)
