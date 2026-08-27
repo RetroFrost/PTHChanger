@@ -1,0 +1,2 @@
+-keep class org.pytorch.executorch.** { *; }
+-keep class ai.onnxruntime.** { *; }

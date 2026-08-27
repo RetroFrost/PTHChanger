@@ -1,0 +1,8 @@
+.gradle/
+.idea/
+local.properties
+**/build/
+*.iml
+# Shared neural assets are large and are installed before APK assembly.
+app/src/main/assets/runtime/*.onnx
+app/src/main/assets/runtime/*.pte
