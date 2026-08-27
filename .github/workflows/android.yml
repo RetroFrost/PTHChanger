@@ -3,7 +3,7 @@ name: Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, prod-ready ]
     paths-ignore:
       - '**.md'
 
@@ -43,9 +43,14 @@ jobs:
             -o app/src/main/assets/runtime/rmvpe.onnx
 
           python - <<'PY'
+          import numpy as np
           import onnx
+          import onnxruntime as ort
           from pathlib import Path
-          for p in [Path('app/src/main/assets/runtime/contentvec_v2.onnx'), Path('app/src/main/assets/runtime/rmvpe.onnx')]:
+
+          cv_path = Path('app/src/main/assets/runtime/contentvec_v2.onnx')
+          rm_path = Path('app/src/main/assets/runtime/rmvpe.onnx')
+          for p in [cv_path, rm_path]:
               m = onnx.load(str(p), load_external_data=False)
               print('\nMODEL', p, f'{p.stat().st_size / 1024**2:.1f} MiB')
               print(' inputs:')
@@ -56,6 +61,20 @@ jobs:
               for x in m.graph.output:
                   dims = [d.dim_value if d.dim_value else d.dim_param for d in x.type.tensor_type.shape.dim]
                   print('  ', x.name, x.type.tensor_type.elem_type, dims)
+
+          cv = ort.InferenceSession(str(cv_path), providers=['CPUExecutionProvider'])
+          wave = np.zeros((1, 16000), np.float32)
+          mask = np.ones((1, 16000), np.int64)
+          hidden = cv.run(['hidden_states'], {'input_values': wave, 'attention_mask': mask})[0]
+          assert hidden.ndim == 3 and hidden.shape[0] == 1 and hidden.shape[2] == 768, hidden.shape
+          assert np.isfinite(hidden).all()
+          print('ContentVec smoke:', hidden.shape)
+
+          rm = ort.InferenceSession(str(rm_path), providers=['CPUExecutionProvider'])
+          salience = rm.run(['output'], {'input': np.zeros((1, 128, 32), np.float32)})[0]
+          assert salience.shape == (1, 32, 360), salience.shape
+          assert np.isfinite(salience).all()
+          print('RMVPE smoke:', salience.shape)
           PY
 
           test -s app/src/main/assets/runtime/contentvec_v2.onnx
