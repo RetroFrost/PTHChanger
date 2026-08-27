@@ -25,7 +25,7 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.1
-          python -m pip install onnx==1.18.0 onnxruntime==1.22.0 numpy
+          python -m pip install onnx==1.18.0 onnxruntime==1.22.0 numpy scipy
 
           mkdir -p .runtime app/src/main/assets/runtime
           git clone --depth 1 https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git .runtime/rvc
